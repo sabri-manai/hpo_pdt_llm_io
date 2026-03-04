@@ -19,6 +19,12 @@ DEFAULT_CSV_PATH = Path("surrogate_ready_dataset/patchcore_surrogate_dataset_xgb
 DEFAULT_MODEL_PATH = Path("surrogate_pkl_cfs_metadata/surrogate_catboost.cbm")
 DEFAULT_EXPORT_DIR = Path("surrogate_pkl_cfs_metadata")
 DEFAULT_LLM_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+LLM_MODEL_OPTIONS = [
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "microsoft/Phi-3-mini-4k-instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
+]
 
 TARGET = "value"
 
@@ -565,6 +571,16 @@ def normalize_selection(sel: Dict[str, Any]) -> Dict[str, Any]:
     return {"k": int(sel.get("k", DEFAULT_K)), "mode": canonical_selection_mode(sel.get("mode", DEFAULT_MODE))}
 
 
+def _strip_unknown_query_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only fields used by our query contract and ignore all extras from the LLM output."""
+    q = raw if isinstance(raw, dict) else {}
+    return {
+        "objective": q.get("objective", {}),
+        "soft_constraints": q.get("soft_constraints", {}),
+        "selection": q.get("selection", {}),
+    }
+
+
 def _iter_user_lines(user_text: str):
     for part in re.split(r"[\r\n;]+", user_text.lower()):
         p = part.strip()
@@ -715,15 +731,13 @@ def build_query_core(
             raw = llama_json_fn(prompt)
             draft = json.loads(raw)
 
-            core = dict(draft)
+            core = _strip_unknown_query_fields(dict(draft))
             if "objective" in core:
                 core["objective"] = normalize_objective(core["objective"])
             if "soft_constraints" in core:
                 core["soft_constraints"] = normalize_soft_constraints(core["soft_constraints"], x_factual=x_factual)
             if "selection" in core:
                 core["selection"] = normalize_selection(core["selection"])
-
-            validate(instance=core, schema=QUERY_SCHEMA)
             repaired = repair_and_snap(core, x_factual=x_factual, y_factual_sur=y_factual_sur)
             repaired = apply_explicit_preferences(repaired, user_text=user_text, x_factual=x_factual)
             repaired = repair_and_snap(repaired, x_factual=x_factual, y_factual_sur=y_factual_sur)
@@ -1508,7 +1522,11 @@ def main():
         st.header("Configuration")
         csv_path = st.text_input("CSV path", str(DEFAULT_CSV_PATH))
         model_path = st.text_input("Surrogate model path", str(DEFAULT_MODEL_PATH))
-        llm_model_id = st.text_input("LLM model id", DEFAULT_LLM_MODEL_ID)
+        model_choice = st.selectbox("LLM model", LLM_MODEL_OPTIONS + ["Custom model id"]) 
+        if model_choice == "Custom model id":
+            llm_model_id = st.text_input("Custom LLM model id", DEFAULT_LLM_MODEL_ID)
+        else:
+            llm_model_id = model_choice
         export_dir = st.text_input("Export directory", str(DEFAULT_EXPORT_DIR))
 
         st.header("Run settings")
