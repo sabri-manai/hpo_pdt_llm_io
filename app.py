@@ -11,7 +11,7 @@ import streamlit as st
 import torch
 from catboost import CatBoostRegressor
 from dice_ml import Dice
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
@@ -19,6 +19,12 @@ DEFAULT_CSV_PATH = Path("surrogate_ready_dataset/patchcore_surrogate_dataset_xgb
 DEFAULT_MODEL_PATH = Path("surrogate_pkl_cfs_metadata/surrogate_catboost.cbm")
 DEFAULT_EXPORT_DIR = Path("surrogate_pkl_cfs_metadata")
 DEFAULT_LLM_MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
+LLM_MODEL_OPTIONS = [
+    "Qwen/Qwen2.5-3B-Instruct",
+    "Qwen/Qwen2.5-7B-Instruct",
+    "microsoft/Phi-3-mini-4k-instruct",
+    "meta-llama/Llama-3.2-3B-Instruct",
+]
 
 TARGET = "value"
 
@@ -565,6 +571,16 @@ def normalize_selection(sel: Dict[str, Any]) -> Dict[str, Any]:
     return {"k": int(sel.get("k", DEFAULT_K)), "mode": canonical_selection_mode(sel.get("mode", DEFAULT_MODE))}
 
 
+def _strip_unknown_query_fields(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only fields used by our query contract and ignore all extras from the LLM output."""
+    q = raw if isinstance(raw, dict) else {}
+    return {
+        "objective": q.get("objective", {}),
+        "soft_constraints": q.get("soft_constraints", {}),
+        "selection": q.get("selection", {}),
+    }
+
+
 def _iter_user_lines(user_text: str):
     for part in re.split(r"[\r\n;]+", user_text.lower()):
         p = part.strip()
@@ -580,6 +596,17 @@ def extract_explicit_preferences(user_text: str, x_factual: Dict[str, Any] = Non
     objective = None
 
     for ln in _iter_user_lines(user_text):
+        m_band = re.search(
+            r"(?:quality|performance)?\s*(?:between|from)\s*([0-9]*\.?[0-9]+)\s*(?:and|to|-)\s*([0-9]*\.?[0-9]+)",
+            ln,
+        )
+        if m_band:
+            lo, hi = float(m_band.group(1)), float(m_band.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            objective = {"type": "target_band", "lower": lo, "upper": hi, "eps": DEFAULT_EPS}
+            continue
+
         m_min = re.search(
             r"(?:min(?:imum)?\s*(?:performance|quality)?\s*(?:should\s*be|is|:)?|(?:performance|quality)\s*(?:should\s*be|is|:)?\s*at\s*least)\s*([0-9]*\.?[0-9]+)",
             ln,
@@ -692,21 +719,25 @@ def build_query_core(
 ) -> Dict[str, Any]:
     last_error: Exception | None = None
 
+    def _short_error(exc: Exception) -> str:
+        if isinstance(exc, ValidationError):
+            return exc.message
+        txt = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return txt[:250]
+
     for attempt in range(max_retries + 1):
         try:
             prompt = CONTRACT_PROMPT + "\n\nUSER REQUEST:\n" + user_text.strip()
             raw = llama_json_fn(prompt)
             draft = json.loads(raw)
 
-            core = dict(draft)
+            core = _strip_unknown_query_fields(dict(draft))
             if "objective" in core:
                 core["objective"] = normalize_objective(core["objective"])
             if "soft_constraints" in core:
                 core["soft_constraints"] = normalize_soft_constraints(core["soft_constraints"], x_factual=x_factual)
             if "selection" in core:
                 core["selection"] = normalize_selection(core["selection"])
-
-            validate(instance=core, schema=QUERY_SCHEMA)
             repaired = repair_and_snap(core, x_factual=x_factual, y_factual_sur=y_factual_sur)
             repaired = apply_explicit_preferences(repaired, user_text=user_text, x_factual=x_factual)
             repaired = repair_and_snap(repaired, x_factual=x_factual, y_factual_sur=y_factual_sur)
@@ -719,7 +750,7 @@ def build_query_core(
     core = fallback_query_core(x_factual=x_factual, y_factual_sur=y_factual_sur)
     core = apply_explicit_preferences(core, user_text=user_text, x_factual=x_factual)
     core = repair_and_snap(core, x_factual=x_factual, y_factual_sur=y_factual_sur)
-    core["_meta"] = {"used_fallback": True, "reason": str(last_error)[:250] if last_error else "unknown"}
+    core["_meta"] = {"used_fallback": True, "reason": _short_error(last_error) if last_error else "unknown"}
     return core
 
 
@@ -1298,6 +1329,16 @@ def run_pipeline(
         df=df, cb=cb, query=query_final, desired_range=desired_range
     )
 
+    records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+    if not cf_df.empty:
+        cf_df = cf_df.drop_duplicates(subset=FEATURES + [TARGET]).reset_index(drop=True)
+        records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+        if not eval_df.empty:
+            ranked = eval_df.sort_values(["objective_match", "soft_match_rate", "score"], ascending=[False, False, False])
+            keep_ids = ranked["cf_id"].astype(int).tolist()[: int(query_final["selection"]["k"])]
+            cf_df = cf_df.iloc[keep_ids].reset_index(drop=True)
+            records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+
     cfs_out, cfs_path, meta_path = export_artifacts(
         cf_df=cf_df,
         query=query_final,
@@ -1306,8 +1347,6 @@ def run_pipeline(
         model_path=model_path,
         export_dir=export_dir,
     )
-
-    records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
 
     explanation = "No counterfactuals available to explain."
     explain_path = None
@@ -1348,9 +1387,89 @@ def run_pipeline(
     }
 
 
+def _humanize_constraint(feat: str, spec: Dict[str, Any]) -> str:
+    label = FEATURE_LABELS.get(feat, feat)
+    mode = spec.get("mode", "free")
+    if mode == "free":
+        return f"{label}: can change freely"
+    if mode == "fixed":
+        return f"{label}: fixed at {spec.get('value')}"
+    if mode == "range":
+        return f"{label}: must stay between {spec.get('lower')} and {spec.get('upper')}"
+    if mode == "allowed":
+        allowed = ", ".join(str(v) for v in spec.get("allowed", []))
+        return f"{label}: allowed values [{allowed}]"
+    return f"{label}: unknown rule"
+
+
+def _humanize_objective(objective: Dict[str, Any], factual_value: float) -> str:
+    t = objective.get("type")
+    if t == "target_min":
+        return f"Reach at least {float(objective.get('value', factual_value)):.4f} quality score."
+    if t == "delta_improve":
+        delta = float(objective.get("delta", 0.0))
+        return f"Improve quality by at least +{delta:.4f} from the current score ({factual_value:.4f})."
+    if t == "target_band":
+        lo = float(objective.get("lower", factual_value))
+        hi = float(objective.get("upper", factual_value))
+        return f"Keep quality score within [{lo:.4f}, {hi:.4f}]."
+    return "Objective could not be interpreted."
+
+
+def _readable_eval_table(eval_df: pd.DataFrame) -> pd.DataFrame:
+    if eval_df.empty:
+        return eval_df
+    out = eval_df.copy()
+    out["objective_match"] = out["objective_match"].map({True: "Yes", False: "No"})
+    out["soft_match_rate"] = (out["soft_match_rate"] * 100.0).round(1).astype(str) + "%"
+    return out.rename(
+        columns={
+            "cf_id": "Option",
+            "score": "Predicted quality",
+            "objective_match": "Meets objective",
+            "soft_match_rate": "Constraint match rate",
+            "violations": "Violated constraints",
+            "changed_feature_count": "Changed settings",
+        }
+    )
+
+
+def _readable_cf_table(cf_df: pd.DataFrame) -> pd.DataFrame:
+    if cf_df.empty:
+        return cf_df
+    out = cf_df.copy()
+    rename_map = {feat: FEATURE_LABELS.get(feat, feat) for feat in FEATURES}
+    rename_map[TARGET] = TARGET_LABEL
+    return out.rename(columns=rename_map)
+
+
 def render_result(result: Dict[str, Any]):
-    st.subheader("Query (final)")
-    st.json(result["query"])
+    factual_score = float(result["query"]["factual"]["value_surrogate"])
+    objective = result["query"]["objective"]
+    objective_summary = _humanize_objective(objective, factual_score)
+    constraints_summary = [
+        _humanize_constraint(feat, spec) for feat, spec in result["query"]["soft_constraints"].items()
+    ]
+    readable_cf = _readable_cf_table(result["cf_df"])
+    readable_eval = _readable_eval_table(result["eval_df"])
+
+    st.subheader("Quick interpretation")
+    st.info(
+        "\n".join(
+            [
+                f"Current predicted quality: {factual_score:.4f}",
+                f"Objective: {objective_summary}",
+                f"Selection strategy: {SELECTION_MODE_LABELS.get(result['query']['selection']['mode'], result['query']['selection']['mode'])}",
+            ]
+        )
+    )
+
+    with st.expander("Constraint summary (plain language)", expanded=True):
+        for line in constraints_summary:
+            st.write(f"- {line}")
+
+    with st.expander("Parsed query JSON (advanced)"):
+        st.json(result["query"])
 
     st.subheader("Generation summary")
     c1, c2, c3 = st.columns(3)
@@ -1362,14 +1481,14 @@ def render_result(result: Dict[str, Any]):
     st.write("`permitted_range`:")
     st.json(result["permitted_range"])
 
-    st.subheader("Final CF table (top-k)")
-    st.dataframe(result["cf_df"], use_container_width=True)
+    st.subheader("Generated options (top-k)")
+    st.dataframe(readable_cf, use_container_width=True)
     st.caption(f"Kept {len(result['cf_df'])} CFs (requested {int(result['query']['selection']['k'])}).")
 
-    st.subheader("CF alignment table")
-    st.dataframe(result["eval_df"], use_container_width=True)
+    st.subheader("How well each option matches your request")
+    st.dataframe(readable_eval, use_container_width=True)
 
-    st.subheader("LLM explanation")
+    st.subheader("Natural-language recommendation")
     st.text(result["explanation"])
 
     st.subheader("Saved artifacts")
@@ -1407,13 +1526,17 @@ def render_result(result: Dict[str, Any]):
 def main():
     st.set_page_config(page_title="Counterfactual Explorer", layout="wide")
     st.title("Counterfactual Explorer")
-    st.caption("Streamlit server converted from `master.ipynb`.")
+    st.caption("Decision support for non-experts: describe your goal in plain language and compare suggested options.")
 
     with st.sidebar:
         st.header("Configuration")
         csv_path = st.text_input("CSV path", str(DEFAULT_CSV_PATH))
         model_path = st.text_input("Surrogate model path", str(DEFAULT_MODEL_PATH))
-        llm_model_id = st.text_input("LLM model id", DEFAULT_LLM_MODEL_ID)
+        model_choice = st.selectbox("LLM model", LLM_MODEL_OPTIONS + ["Custom model id"]) 
+        if model_choice == "Custom model id":
+            llm_model_id = st.text_input("Custom LLM model id", DEFAULT_LLM_MODEL_ID)
+        else:
+            llm_model_id = model_choice
         export_dir = st.text_input("Export directory", str(DEFAULT_EXPORT_DIR))
 
         st.header("Run settings")
@@ -1447,7 +1570,8 @@ def main():
         options[label] = int(row["candidate_pick"])
 
     selected_label = st.selectbox("Factual", list(options.keys()), index=0)
-    user_text = st.text_area("Preferences", value=DEFAULT_USER_TEXT, height=180)
+    st.caption("Tip: use simple instructions like 'Improve quality by +0.02' or 'Keep review budget fixed'.")
+    user_text = st.text_area("Preferences (plain language)", value=DEFAULT_USER_TEXT, height=180)
     run_clicked = st.button("Run pipeline", type="primary")
 
     if run_clicked:
@@ -1481,4 +1605,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-X
