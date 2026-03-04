@@ -11,7 +11,7 @@ import streamlit as st
 import torch
 from catboost import CatBoostRegressor
 from dice_ml import Dice
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
@@ -580,6 +580,17 @@ def extract_explicit_preferences(user_text: str, x_factual: Dict[str, Any] = Non
     objective = None
 
     for ln in _iter_user_lines(user_text):
+        m_band = re.search(
+            r"(?:quality|performance)?\s*(?:between|from)\s*([0-9]*\.?[0-9]+)\s*(?:and|to|-)\s*([0-9]*\.?[0-9]+)",
+            ln,
+        )
+        if m_band:
+            lo, hi = float(m_band.group(1)), float(m_band.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            objective = {"type": "target_band", "lower": lo, "upper": hi, "eps": DEFAULT_EPS}
+            continue
+
         m_min = re.search(
             r"(?:min(?:imum)?\s*(?:performance|quality)?\s*(?:should\s*be|is|:)?|(?:performance|quality)\s*(?:should\s*be|is|:)?\s*at\s*least)\s*([0-9]*\.?[0-9]+)",
             ln,
@@ -692,6 +703,12 @@ def build_query_core(
 ) -> Dict[str, Any]:
     last_error: Exception | None = None
 
+    def _short_error(exc: Exception) -> str:
+        if isinstance(exc, ValidationError):
+            return exc.message
+        txt = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return txt[:250]
+
     for attempt in range(max_retries + 1):
         try:
             prompt = CONTRACT_PROMPT + "\n\nUSER REQUEST:\n" + user_text.strip()
@@ -719,7 +736,7 @@ def build_query_core(
     core = fallback_query_core(x_factual=x_factual, y_factual_sur=y_factual_sur)
     core = apply_explicit_preferences(core, user_text=user_text, x_factual=x_factual)
     core = repair_and_snap(core, x_factual=x_factual, y_factual_sur=y_factual_sur)
-    core["_meta"] = {"used_fallback": True, "reason": str(last_error)[:250] if last_error else "unknown"}
+    core["_meta"] = {"used_fallback": True, "reason": _short_error(last_error) if last_error else "unknown"}
     return core
 
 
@@ -1298,6 +1315,16 @@ def run_pipeline(
         df=df, cb=cb, query=query_final, desired_range=desired_range
     )
 
+    records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+    if not cf_df.empty:
+        cf_df = cf_df.drop_duplicates(subset=FEATURES + [TARGET]).reset_index(drop=True)
+        records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+        if not eval_df.empty:
+            ranked = eval_df.sort_values(["objective_match", "soft_match_rate", "score"], ascending=[False, False, False])
+            keep_ids = ranked["cf_id"].astype(int).tolist()[: int(query_final["selection"]["k"])]
+            cf_df = cf_df.iloc[keep_ids].reset_index(drop=True)
+            records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
+
     cfs_out, cfs_path, meta_path = export_artifacts(
         cf_df=cf_df,
         query=query_final,
@@ -1306,8 +1333,6 @@ def run_pipeline(
         model_path=model_path,
         export_dir=export_dir,
     )
-
-    records, eval_df = build_alignment_records(cf_df=cf_df, query=query_final)
 
     explanation = "No counterfactuals available to explain."
     explain_path = None
