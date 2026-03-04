@@ -1434,15 +1434,6 @@ def _readable_eval_table(eval_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _readable_cf_table(cf_df: pd.DataFrame) -> pd.DataFrame:
-    if cf_df.empty:
-        return cf_df
-    out = cf_df.copy()
-    rename_map = {feat: FEATURE_LABELS.get(feat, feat) for feat in FEATURES}
-    rename_map[TARGET] = TARGET_LABEL
-    return out.rename(columns=rename_map)
-
-
 def render_result(result: Dict[str, Any]):
     factual_score = float(result["query"]["factual"]["value_surrogate"])
     objective = result["query"]["objective"]
@@ -1450,7 +1441,6 @@ def render_result(result: Dict[str, Any]):
     constraints_summary = [
         _humanize_constraint(feat, spec) for feat, spec in result["query"]["soft_constraints"].items()
     ]
-    readable_cf = _readable_cf_table(result["cf_df"])
     readable_eval = _readable_eval_table(result["eval_df"])
 
     st.subheader("Quick interpretation")
@@ -1482,7 +1472,7 @@ def render_result(result: Dict[str, Any]):
     st.json(result["permitted_range"])
 
     st.subheader("Generated options (top-k)")
-    st.dataframe(readable_cf, use_container_width=True)
+    st.dataframe(result["cf_df"], use_container_width=True)
     st.caption(f"Kept {len(result['cf_df'])} CFs (requested {int(result['query']['selection']['k'])}).")
 
     st.subheader("How well each option matches your request")
