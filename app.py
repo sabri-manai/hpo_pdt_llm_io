@@ -1348,9 +1348,79 @@ def run_pipeline(
     }
 
 
+def _humanize_constraint(feat: str, spec: Dict[str, Any]) -> str:
+    label = FEATURE_LABELS.get(feat, feat)
+    mode = spec.get("mode", "free")
+    if mode == "free":
+        return f"{label}: can change freely"
+    if mode == "fixed":
+        return f"{label}: fixed at {spec.get('value')}"
+    if mode == "range":
+        return f"{label}: must stay between {spec.get('lower')} and {spec.get('upper')}"
+    if mode == "allowed":
+        allowed = ", ".join(str(v) for v in spec.get("allowed", []))
+        return f"{label}: allowed values [{allowed}]"
+    return f"{label}: unknown rule"
+
+
+def _humanize_objective(objective: Dict[str, Any], factual_value: float) -> str:
+    t = objective.get("type")
+    if t == "target_min":
+        return f"Reach at least {float(objective.get('value', factual_value)):.4f} quality score."
+    if t == "delta_improve":
+        delta = float(objective.get("delta", 0.0))
+        return f"Improve quality by at least +{delta:.4f} from the current score ({factual_value:.4f})."
+    if t == "target_band":
+        lo = float(objective.get("lower", factual_value))
+        hi = float(objective.get("upper", factual_value))
+        return f"Keep quality score within [{lo:.4f}, {hi:.4f}]."
+    return "Objective could not be interpreted."
+
+
+def _readable_eval_table(eval_df: pd.DataFrame) -> pd.DataFrame:
+    if eval_df.empty:
+        return eval_df
+    out = eval_df.copy()
+    out["objective_match"] = out["objective_match"].map({True: "Yes", False: "No"})
+    out["soft_match_rate"] = (out["soft_match_rate"] * 100.0).round(1).astype(str) + "%"
+    return out.rename(
+        columns={
+            "cf_id": "Option",
+            "score": "Predicted quality",
+            "objective_match": "Meets objective",
+            "soft_match_rate": "Constraint match rate",
+            "violations": "Violated constraints",
+            "changed_feature_count": "Changed settings",
+        }
+    )
+
+
 def render_result(result: Dict[str, Any]):
-    st.subheader("Query (final)")
-    st.json(result["query"])
+    factual_score = float(result["query"]["factual"]["value_surrogate"])
+    objective = result["query"]["objective"]
+    objective_summary = _humanize_objective(objective, factual_score)
+    constraints_summary = [
+        _humanize_constraint(feat, spec) for feat, spec in result["query"]["soft_constraints"].items()
+    ]
+    readable_eval = _readable_eval_table(result["eval_df"])
+
+    st.subheader("Quick interpretation")
+    st.info(
+        "\n".join(
+            [
+                f"Current predicted quality: {factual_score:.4f}",
+                f"Objective: {objective_summary}",
+                f"Selection strategy: {SELECTION_MODE_LABELS.get(result['query']['selection']['mode'], result['query']['selection']['mode'])}",
+            ]
+        )
+    )
+
+    with st.expander("Constraint summary (plain language)", expanded=True):
+        for line in constraints_summary:
+            st.write(f"- {line}")
+
+    with st.expander("Parsed query JSON (advanced)"):
+        st.json(result["query"])
 
     st.subheader("Generation summary")
     c1, c2, c3 = st.columns(3)
@@ -1362,14 +1432,14 @@ def render_result(result: Dict[str, Any]):
     st.write("`permitted_range`:")
     st.json(result["permitted_range"])
 
-    st.subheader("Final CF table (top-k)")
+    st.subheader("Generated options (top-k)")
     st.dataframe(result["cf_df"], use_container_width=True)
     st.caption(f"Kept {len(result['cf_df'])} CFs (requested {int(result['query']['selection']['k'])}).")
 
-    st.subheader("CF alignment table")
-    st.dataframe(result["eval_df"], use_container_width=True)
+    st.subheader("How well each option matches your request")
+    st.dataframe(readable_eval, use_container_width=True)
 
-    st.subheader("LLM explanation")
+    st.subheader("Natural-language recommendation")
     st.text(result["explanation"])
 
     st.subheader("Saved artifacts")
@@ -1407,7 +1477,7 @@ def render_result(result: Dict[str, Any]):
 def main():
     st.set_page_config(page_title="Counterfactual Explorer", layout="wide")
     st.title("Counterfactual Explorer")
-    st.caption("Streamlit server converted from `master.ipynb`.")
+    st.caption("Decision support for non-experts: describe your goal in plain language and compare suggested options.")
 
     with st.sidebar:
         st.header("Configuration")
@@ -1447,7 +1517,8 @@ def main():
         options[label] = int(row["candidate_pick"])
 
     selected_label = st.selectbox("Factual", list(options.keys()), index=0)
-    user_text = st.text_area("Preferences", value=DEFAULT_USER_TEXT, height=180)
+    st.caption("Tip: use simple instructions like 'Improve quality by +0.02' or 'Keep review budget fixed'.")
+    user_text = st.text_area("Preferences (plain language)", value=DEFAULT_USER_TEXT, height=180)
     run_clicked = st.button("Run pipeline", type="primary")
 
     if run_clicked:
@@ -1481,4 +1552,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-X
